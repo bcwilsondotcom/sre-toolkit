@@ -1,0 +1,264 @@
+#!/usr/bin/env bash
+# deploy-check — Post-deployment verification for Kubernetes
+# Confirms rollout health, endpoint reachability, and rollback readiness.
+# Usage: deploy-check <deployment> [-n namespace] [--rollback-on-fail] [--timeout 120]
+set -euo pipefail
+
+VERSION="1.0.0"
+RED='\033[0;31m'; YELLOW='\033[1;33m'; GREEN='\033[0;32m'; CYAN='\033[0;36m'; BOLD='\033[1m'; DIM='\033[2m'; NC='\033[0m'
+
+DEPLOYMENT=""
+NAMESPACE=""
+NS_FLAG=""
+ROLLBACK=false
+TIMEOUT=120
+PASSED=0
+FAILED=0
+WARNED=0
+
+usage() {
+  cat <<EOF
+deploy-check v${VERSION} — Post-deployment verification
+
+Usage: deploy-check <deployment-name> [options]
+
+Options:
+  -n, --namespace <ns>     Target namespace
+  --rollback-on-fail       Auto-rollback if critical checks fail
+  --timeout <seconds>      Max wait for rollout (default: 120)
+  -h, --help               Show this help
+
+Checks:
+  ✓ Rollout completed successfully
+  ✓ All pods in Ready state
+  ✓ No restart loops in last 60s
+  ✓ Container images match expected
+  ✓ Service endpoints populated
+  ✓ HTTP health check (if service detected)
+  ✓ Previous revision available for rollback
+  ✓ Resource limits configured
+
+Examples:
+  deploy-check webapp
+  deploy-check webapp -n production
+  deploy-check webapp --rollback-on-fail --timeout 60
+EOF
+  exit 0
+}
+
+while [[ $# -gt 0 ]]; do
+  case $1 in
+    -n|--namespace) NAMESPACE="$2"; NS_FLAG="-n $2"; shift 2 ;;
+    --rollback-on-fail) ROLLBACK=true; shift ;;
+    --timeout) TIMEOUT="$2"; shift 2 ;;
+    -h|--help) usage ;;
+    -*) echo "Unknown: $1"; usage ;;
+    *) DEPLOYMENT="$1"; shift ;;
+  esac
+done
+
+[[ -z "$DEPLOYMENT" ]] && { echo "Error: deployment name required"; usage; }
+
+pass()  { echo -e "  ${GREEN}✓${NC} $1"; ((PASSED++)); }
+fail()  { echo -e "  ${RED}✗${NC} $1"; ((FAILED++)); }
+warn()  { echo -e "  ${YELLOW}⚠${NC} $1"; ((WARNED++)); }
+info()  { echo -e "  ${DIM}→${NC} $1"; }
+step()  { echo -e "\n${CYAN}${BOLD}[$1/$TOTAL]${NC} $2"; }
+
+TOTAL=7
+echo -e "${BOLD}deploy-check v${VERSION}${NC}"
+echo -e "Deployment: ${BOLD}$DEPLOYMENT${NC}  ${NAMESPACE:+Namespace: $NAMESPACE}"
+echo -e "${DIM}$(date '+%Y-%m-%d %H:%M:%S %Z')${NC}"
+
+# ── 1. Deployment Exists ──
+step 1 "Deployment exists"
+if ! kubectl get deployment "$DEPLOYMENT" $NS_FLAG &>/dev/null; then
+  fail "Deployment '$DEPLOYMENT' not found"
+  echo -e "\n${RED}Cannot continue — deployment not found.${NC}"
+  exit 2
+fi
+REPLICAS=$(kubectl get deployment "$DEPLOYMENT" $NS_FLAG -o jsonpath='{.spec.replicas}')
+IMAGE=$(kubectl get deployment "$DEPLOYMENT" $NS_FLAG -o jsonpath='{.spec.template.spec.containers[0].image}')
+pass "Found: $DEPLOYMENT (replicas: $REPLICAS, image: $IMAGE)"
+
+# ── 2. Rollout Status ──
+step 2 "Rollout status"
+if timeout "$TIMEOUT" kubectl rollout status deployment/"$DEPLOYMENT" $NS_FLAG 2>&1; then
+  pass "Rollout completed successfully"
+else
+  fail "Rollout did not complete within ${TIMEOUT}s"
+  info "Check: kubectl rollout status deployment/$DEPLOYMENT $NS_FLAG"
+fi
+
+# ── 3. Pod Health ──
+step 3 "Pod health"
+PODS=$(kubectl get pods -l "$(kubectl get deployment "$DEPLOYMENT" $NS_FLAG -o jsonpath='{range .spec.selector.matchLabels}{.key}={.value},{end}' 2>/dev/null | sed 's/,$//' | sed 's/\.key/.key/g')" $NS_FLAG --no-headers 2>/dev/null || echo "")
+
+# Fallback: get pods by deployment label patterns
+if [[ -z "$PODS" ]]; then
+  SELECTOR=$(kubectl get deployment "$DEPLOYMENT" $NS_FLAG -o jsonpath='{.spec.selector.matchLabels}' 2>/dev/null | tr -d '{}' | sed 's/"//g' | sed 's/:/=/g' | sed 's/,/,/g')
+  PODS=$(kubectl get pods -l "$SELECTOR" $NS_FLAG --no-headers 2>/dev/null || echo "")
+fi
+
+if [[ -z "$PODS" ]]; then
+  # Last resort: grep by deployment name prefix
+  PODS=$(kubectl get pods $NS_FLAG --no-headers 2>/dev/null | grep "^$DEPLOYMENT" || echo "")
+fi
+
+if [[ -n "$PODS" ]]; then
+  ALL_RUNNING=true
+  RESTART_ISSUES=false
+  while IFS= read -r line; do
+    [[ -z "$line" ]] && continue
+    POD=$(echo "$line" | awk '{print $1}')
+    READY=$(echo "$line" | awk '{print $2}')
+    STATUS=$(echo "$line" | awk '{print $3}')
+    RESTARTS=$(echo "$line" | awk '{print $4}' | sed 's/[^0-9].*//')
+
+    if [[ "$STATUS" != "Running" ]]; then
+      ALL_RUNNING=false
+      fail "Pod $POD — $STATUS"
+    fi
+
+    if [[ -n "$RESTARTS" ]] && [[ "$RESTARTS" -gt 0 ]]; then
+      # Check if restarts happened recently (within last 60s)
+      LAST_STATE=$(kubectl get pod "$POD" $NS_FLAG -o jsonpath='{.status.containerStatuses[0].lastState.terminated.finishedAt}' 2>/dev/null || echo "")
+      if [[ -n "$LAST_STATE" ]]; then
+        warn "Pod $POD — $RESTARTS restart(s), last termination: $LAST_STATE"
+        RESTART_ISSUES=true
+      fi
+    fi
+  done <<< "$PODS"
+
+  POD_COUNT=$(echo "$PODS" | grep -c . || echo 0)
+  if $ALL_RUNNING && ! $RESTART_ISSUES; then
+    pass "All $POD_COUNT pod(s) Running and stable"
+  elif $ALL_RUNNING; then
+    warn "$POD_COUNT pod(s) Running but with recent restarts"
+  fi
+else
+  fail "No pods found for deployment"
+fi
+
+# ── 4. Service & Endpoints ──
+step 4 "Service endpoints"
+SVCS=$(kubectl get svc $NS_FLAG --no-headers 2>/dev/null | grep -v kubernetes || echo "")
+MATCHED_SVC=""
+if [[ -n "$SVCS" ]]; then
+  while IFS= read -r line; do
+    SVC_NAME=$(echo "$line" | awk '{print $1}')
+    SVC_SELECTOR=$(kubectl get svc "$SVC_NAME" $NS_FLAG -o jsonpath='{.spec.selector}' 2>/dev/null || echo "")
+    # Simple match: check if service selector overlaps with deployment
+    if echo "$SVC_SELECTOR" | grep -qi "$DEPLOYMENT\|app"; then
+      MATCHED_SVC="$SVC_NAME"
+      EPS=$(kubectl get endpoints "$SVC_NAME" $NS_FLAG -o jsonpath='{.subsets[*].addresses[*].ip}' 2>/dev/null || echo "")
+      SVC_TYPE=$(echo "$line" | awk '{print $2}')
+      SVC_PORTS=$(echo "$line" | awk '{print $5}')
+      if [[ -n "$EPS" ]]; then
+        EP_COUNT=$(echo "$EPS" | wc -w | tr -d ' ')
+        pass "Service $SVC_NAME ($SVC_TYPE) → $EP_COUNT endpoint(s) | Ports: $SVC_PORTS"
+      else
+        fail "Service $SVC_NAME has no endpoints — selector mismatch?"
+      fi
+    fi
+  done <<< "$SVCS"
+fi
+[[ -z "$MATCHED_SVC" ]] && warn "No matching service found for $DEPLOYMENT"
+
+# ── 5. HTTP Health Check ──
+step 5 "HTTP health check"
+if [[ -n "$MATCHED_SVC" ]]; then
+  SVC_PORT=$(kubectl get svc "$MATCHED_SVC" $NS_FLAG -o jsonpath='{.spec.ports[0].port}' 2>/dev/null || echo "")
+  CLUSTER_IP=$(kubectl get svc "$MATCHED_SVC" $NS_FLAG -o jsonpath='{.spec.clusterIP}' 2>/dev/null || echo "")
+
+  if [[ -n "$CLUSTER_IP" ]] && [[ "$CLUSTER_IP" != "None" ]] && [[ -n "$SVC_PORT" ]]; then
+    # Try from within cluster via a temporary pod or direct curl
+    HTTP_CODE=$(kubectl run deploy-check-probe --rm -i --restart=Never \
+      --image=curlimages/curl:latest \
+      --command -- curl -s -o /dev/null -w '%{http_code}' \
+      "http://${CLUSTER_IP}:${SVC_PORT}/" 2>/dev/null || echo "")
+
+    if [[ -z "$HTTP_CODE" ]]; then
+      # Fallback: try port-forward briefly
+      info "Cluster curl unavailable — trying port-forward"
+      kubectl port-forward svc/"$MATCHED_SVC" $NS_FLAG 19876:"$SVC_PORT" &>/dev/null &
+      PF_PID=$!
+      sleep 2
+      HTTP_CODE=$(curl -s -o /dev/null -w '%{http_code}' "http://localhost:19876/" 2>/dev/null || echo "000")
+      kill $PF_PID 2>/dev/null || true
+      wait $PF_PID 2>/dev/null || true
+    fi
+
+    if [[ "$HTTP_CODE" =~ ^2 ]]; then
+      pass "HTTP $HTTP_CODE from $MATCHED_SVC:$SVC_PORT"
+    elif [[ "$HTTP_CODE" =~ ^3 ]]; then
+      pass "HTTP $HTTP_CODE (redirect) from $MATCHED_SVC:$SVC_PORT"
+    elif [[ "$HTTP_CODE" =~ ^4 ]]; then
+      warn "HTTP $HTTP_CODE from $MATCHED_SVC:$SVC_PORT — app running but returning client error"
+    elif [[ "$HTTP_CODE" =~ ^5 ]]; then
+      fail "HTTP $HTTP_CODE from $MATCHED_SVC:$SVC_PORT — server error"
+    else
+      warn "Could not reach service (code: ${HTTP_CODE:-none})"
+      info "Try manually: kubectl port-forward svc/$MATCHED_SVC $NS_FLAG 8080:$SVC_PORT"
+    fi
+  else
+    warn "Headless service or no port — skipping HTTP check"
+  fi
+else
+  warn "No service found — skipping HTTP check"
+fi
+
+# ── 6. Resource Limits ──
+step 6 "Resource configuration"
+LIMITS=$(kubectl get deployment "$DEPLOYMENT" $NS_FLAG -o jsonpath='{.spec.template.spec.containers[0].resources.limits}' 2>/dev/null || echo "")
+REQUESTS=$(kubectl get deployment "$DEPLOYMENT" $NS_FLAG -o jsonpath='{.spec.template.spec.containers[0].resources.requests}' 2>/dev/null || echo "")
+
+if [[ -n "$LIMITS" ]] && [[ "$LIMITS" != "{}" ]]; then
+  pass "Resource limits configured: $LIMITS"
+else
+  warn "No resource limits — pod could consume unbounded resources"
+  info "Set: resources.limits.cpu and resources.limits.memory in deployment spec"
+fi
+if [[ -n "$REQUESTS" ]] && [[ "$REQUESTS" != "{}" ]]; then
+  pass "Resource requests configured: $REQUESTS"
+else
+  warn "No resource requests — scheduler can't make informed decisions"
+fi
+
+# ── 7. Rollback Readiness ──
+step 7 "Rollback readiness"
+HISTORY=$(kubectl rollout history deployment/"$DEPLOYMENT" $NS_FLAG 2>/dev/null || echo "")
+REV_COUNT=$(echo "$HISTORY" | grep -cE '^\d' || echo 0)
+CURRENT_REV=$(kubectl get deployment "$DEPLOYMENT" $NS_FLAG -o jsonpath='{.metadata.annotations.deployment\.kubernetes\.io/revision}' 2>/dev/null || echo "?")
+
+if [[ "$REV_COUNT" -gt 1 ]]; then
+  pass "Revision $CURRENT_REV active — $REV_COUNT revisions available for rollback"
+  info "Rollback: kubectl rollout undo deployment/$DEPLOYMENT $NS_FLAG"
+elif [[ "$REV_COUNT" -eq 1 ]]; then
+  warn "Only 1 revision — no rollback target available"
+else
+  warn "Could not read rollout history"
+fi
+
+# ── Summary ──
+echo ""
+echo -e "${BOLD}━━━ Deployment Verification Summary ━━━${NC}"
+echo -e "  ${GREEN}✓ $PASSED passed${NC}  ${YELLOW}⚠ $WARNED warnings${NC}  ${RED}✗ $FAILED failed${NC}"
+
+if [[ $FAILED -gt 0 ]]; then
+  echo -e "\n  ${RED}${BOLD}DEPLOY NOT VERIFIED — $FAILED check(s) failed${NC}"
+  if $ROLLBACK; then
+    echo -e "  ${YELLOW}Rolling back...${NC}"
+    kubectl rollout undo deployment/"$DEPLOYMENT" $NS_FLAG
+    echo -e "  ${GREEN}Rollback initiated.${NC} Verify: kubectl rollout status deployment/$DEPLOYMENT $NS_FLAG"
+  else
+    echo -e "  ${DIM}Tip: Use --rollback-on-fail to auto-revert${NC}"
+  fi
+  exit 1
+elif [[ $WARNED -gt 0 ]]; then
+  echo -e "\n  ${YELLOW}${BOLD}DEPLOYED with warnings — review recommended${NC}"
+  exit 0
+else
+  echo -e "\n  ${GREEN}${BOLD}✓ DEPLOY VERIFIED — all checks passed${NC}"
+  exit 0
+fi

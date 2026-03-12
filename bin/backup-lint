@@ -1,0 +1,341 @@
+#!/usr/bin/env bash
+# backup-lint — Static analysis for backup scripts
+# Catches common pg_dump, cron, permission, and scripting bugs.
+# Usage: backup-lint <script> [--fix]
+set -euo pipefail
+
+VERSION="1.0.0"
+RED='\033[0;31m'; YELLOW='\033[1;33m'; GREEN='\033[0;32m'; CYAN='\033[0;36m'; BOLD='\033[1m'; DIM='\033[2m'; NC='\033[0m'
+
+ISSUES=0
+WARNINGS=0
+FILE=""
+FIX_MODE=false
+
+usage() {
+  cat <<EOF
+backup-lint v${VERSION} — Static analysis for backup scripts
+
+Usage: backup-lint <script> [options]
+
+Options:
+  --fix     Show inline fix suggestions with diff-style output
+  -h        Show this help
+
+Supports: Bash (.sh) and Python (.py) backup scripts
+Checks: shebang, error handling, pg_dump usage, paths, permissions,
+        compression, retention, credentials, quoting, and more.
+
+Examples:
+  backup-lint backup.sh
+  backup-lint backup.py --fix
+EOF
+  exit 0
+}
+
+while [[ $# -gt 0 ]]; do
+  case $1 in
+    --fix) FIX_MODE=true; shift ;;
+    -h|--help) usage ;;
+    -*) echo "Unknown option: $1"; usage ;;
+    *) FILE="$1"; shift ;;
+  esac
+done
+
+[[ -z "$FILE" ]] && { echo "Error: No file specified"; usage; }
+[[ ! -f "$FILE" ]] && { echo "Error: File not found: $FILE"; exit 2; }
+
+CONTENT=$(cat "$FILE")
+LINES=$(wc -l < "$FILE" | tr -d ' ')
+FILENAME=$(basename "$FILE")
+EXT="${FILENAME##*.}"
+
+header() { echo -e "\n${CYAN}${BOLD}━━━ $1 ━━━${NC}"; }
+ok()     { echo -e "  ${GREEN}✓${NC} $1"; }
+warn()   { echo -e "  ${YELLOW}⚠${NC} ${YELLOW}Line $1:${NC} $2"; ((WARNINGS++)); }
+crit()   { echo -e "  ${RED}✗${NC} ${RED}Line $1:${NC} $2"; ((ISSUES++)); }
+fix()    { $FIX_MODE && echo -e "    ${DIM}→ Fix: $1${NC}"; }
+note()   { echo -e "  ${DIM}ℹ $1${NC}"; }
+line_at(){ sed -n "${1}p" "$FILE"; }
+
+echo -e "${BOLD}backup-lint v${VERSION}${NC} — analyzing ${BOLD}$FILENAME${NC} ($LINES lines, $EXT)"
+
+# ═══════════════════════════════════════
+# BASH CHECKS
+# ═══════════════════════════════════════
+if [[ "$EXT" == "sh" ]] || head -1 "$FILE" | grep -q 'bash\|/bin/sh'; then
+
+  header "Shebang & Shell Settings"
+
+  # Shebang
+  FIRST_LINE=$(head -1 "$FILE")
+  if [[ ! "$FIRST_LINE" =~ ^#! ]]; then
+    crit "1" "Missing shebang line"
+    fix "Add #!/bin/bash or #!/usr/bin/env bash as first line"
+  elif [[ ! "$FIRST_LINE" =~ bash ]]; then
+    warn "1" "Shebang is '$FIRST_LINE' — consider #!/usr/bin/env bash for portability"
+  else
+    ok "Shebang present: $FIRST_LINE"
+  fi
+
+  # set -e / set -euo pipefail
+  if ! grep -qE 'set -[a-z]*e' "$FILE" && ! grep -q 'set -o errexit' "$FILE"; then
+    crit "?" "Missing 'set -e' or 'set -euo pipefail' — script won't stop on errors"
+    fix "Add 'set -euo pipefail' after shebang"
+  elif grep -q 'set -euo pipefail' "$FILE"; then
+    ok "Strict mode: set -euo pipefail"
+  elif grep -qE 'set -[a-z]*e' "$FILE"; then
+    warn "?" "Has 'set -e' but consider 'set -euo pipefail' for stricter checks"
+  fi
+
+  header "pg_dump / Database"
+
+  # pg_dump present?
+  if grep -q 'pg_dump' "$FILE"; then
+    # Check for host flag
+    PG_LINE=$(grep -n 'pg_dump' "$FILE" | head -1)
+    PG_LINENUM=$(echo "$PG_LINE" | cut -d: -f1)
+    PG_CMD=$(echo "$PG_LINE" | cut -d: -f2-)
+
+    if ! echo "$PG_CMD" | grep -q '\-h'; then
+      warn "$PG_LINENUM" "pg_dump missing -h (host) flag — defaults to local socket"
+      fix "pg_dump -h \"\$DB_HOST\" -U \"\$DB_USER\" -d \"\$DB_NAME\""
+    fi
+    if ! echo "$PG_CMD" | grep -q '\-U'; then
+      warn "$PG_LINENUM" "pg_dump missing -U (user) flag"
+    fi
+    if ! echo "$PG_CMD" | grep -q '\-d'; then
+      # Check if db name is positional
+      if ! echo "$PG_CMD" | grep -qE '\$\{?DB_NAME\}?|\$\{?DATABASE\}?'; then
+        warn "$PG_LINENUM" "pg_dump — database name not clearly specified"
+      fi
+    fi
+
+    # Error checking after pg_dump
+    NEXT_LINE=$((PG_LINENUM + 1))
+    NEXT_CONTENT=$(sed -n "${NEXT_LINE}p" "$FILE" 2>/dev/null || echo "")
+    if ! echo "$CONTENT" | grep -qE '\$\?|if \[.*-s|\|\|'; then
+      warn "$PG_LINENUM" "No error checking after pg_dump — won't know if backup failed"
+      fix "Add: if [ \$? -ne 0 ] || [ ! -s \"\$FILENAME\" ]; then echo 'FAILED'; exit 1; fi"
+    fi
+
+    ok "pg_dump command found"
+  elif grep -q 'mysqldump' "$FILE"; then
+    note "MySQL backup detected (mysqldump) — pg_dump checks skipped"
+  else
+    warn "?" "No pg_dump or database backup command found"
+  fi
+
+  # PGPASSWORD or .pgpass
+  if grep -q 'pg_dump' "$FILE"; then
+    if grep -q 'PGPASSWORD' "$FILE"; then
+      PW_LINE=$(grep -n 'PGPASSWORD' "$FILE" | head -1 | cut -d: -f1)
+      if grep -q 'PGPASSWORD=.*password\|PGPASSWORD=.*123\|PGPASSWORD=.*secret' "$FILE"; then
+        crit "$PW_LINE" "Hardcoded password in PGPASSWORD — use env var or .pgpass"
+        fix "export PGPASSWORD=\${DB_PASSWORD:-} or use ~/.pgpass with chmod 600"
+      else
+        ok "PGPASSWORD set (verify it's from env, not hardcoded)"
+      fi
+    elif ! grep -q '.pgpass' "$FILE"; then
+      note "No PGPASSWORD or .pgpass reference — pg_dump will prompt for password (breaks in cron)"
+      fix "Add: export PGPASSWORD=\"\$DB_PASSWORD\" or configure ~/.pgpass (chmod 600)"
+    fi
+  fi
+
+  header "File Paths & Directories"
+
+  # mkdir -p for backup dir
+  if grep -qE 'BACKUP_DIR|BACKUP_PATH|DEST|OUTPUT' "$FILE"; then
+    if ! grep -q 'mkdir -p' "$FILE"; then
+      warn "?" "Backup directory variable found but no 'mkdir -p' — dir may not exist"
+      fix "Add: mkdir -p \"\$BACKUP_DIR\""
+    else
+      ok "mkdir -p present"
+    fi
+  fi
+
+  # Unquoted variables in paths
+  LINENUM=0
+  while IFS= read -r line; do
+    ((LINENUM++))
+    # Look for unquoted $VAR in file paths (not in comments)
+    if [[ ! "$line" =~ ^[[:space:]]*# ]] && echo "$line" | grep -qE '[^"]\$[A-Z_]+[^"$].*/' 2>/dev/null; then
+      if echo "$line" | grep -qE '(cp|mv|rm|cat|gzip|pg_dump|>).*[^"]\$[A-Z_]'; then
+        warn "$LINENUM" "Possible unquoted variable in path — breaks on spaces"
+        fix "Quote all variables: \"\$BACKUP_DIR/\$FILENAME\""
+      fi
+    fi
+  done < "$FILE"
+
+  header "Compression & Retention"
+
+  # Compression
+  if grep -q 'gzip\|\.gz\|bzip2\|\.bz2\|xz\|\.xz\|zstd\|\.zst' "$FILE"; then
+    ok "Compression detected"
+  else
+    warn "?" "No compression — backup files will be large"
+    fix "Pipe through gzip: pg_dump ... | gzip > backup.sql.gz"
+  fi
+
+  # Retention / cleanup
+  if grep -q 'find.*-mtime\|find.*-delete\|find.*-exec.*rm\|rotate\|retention' "$FILE"; then
+    # Check find syntax
+    FIND_LINE=$(grep -n 'find.*-mtime' "$FILE" | head -1 || echo "")
+    if [[ -n "$FIND_LINE" ]]; then
+      FL_NUM=$(echo "$FIND_LINE" | cut -d: -f1)
+      FL_CMD=$(echo "$FIND_LINE" | cut -d: -f2-)
+      if ! echo "$FL_CMD" | grep -qE '\-delete|-exec'; then
+        warn "$FL_NUM" "find with -mtime but no -delete or -exec — files won't be removed"
+        fix "Add -delete: find \"\$BACKUP_DIR\" -name '*.sql.gz' -type f -mtime +7 -delete"
+      else
+        ok "Retention policy with cleanup"
+      fi
+    fi
+  else
+    warn "?" "No retention/cleanup — backups will accumulate forever"
+    fix "Add: find \"\$BACKUP_DIR\" -name '*.sql.gz' -type f -mtime +7 -delete"
+  fi
+
+  header "Date & Variables"
+
+  # Date command
+  if grep -q 'date' "$FILE"; then
+    DATE_LINE=$(grep -n 'date' "$FILE" | grep -v '^#' | head -1 || echo "")
+    if [[ -n "$DATE_LINE" ]]; then
+      DL_NUM=$(echo "$DATE_LINE" | cut -d: -f1)
+      DL_CMD=$(echo "$DATE_LINE" | cut -d: -f2-)
+      if echo "$DL_CMD" | grep -q 'date +' && ! echo "$DL_CMD" | grep -qE '\$\(date|`date'; then
+        warn "$DL_NUM" "date command not in command substitution"
+        fix "Use: TIMESTAMP=\$(date +%Y%m%d_%H%M%S)"
+      elif echo "$DL_CMD" | grep -qE 'date\s*$|date\)$|date`$' && ! echo "$DL_CMD" | grep -q '+'; then
+        warn "$DL_NUM" "date without format string — will include spaces in filename"
+        fix "Use: \$(date +%Y%m%d_%H%M%S)"
+      fi
+    fi
+  fi
+
+# ═══════════════════════════════════════
+# PYTHON CHECKS
+# ═══════════════════════════════════════
+elif [[ "$EXT" == "py" ]] || head -1 "$FILE" | grep -q 'python'; then
+
+  header "Shebang & Imports"
+
+  FIRST_LINE=$(head -1 "$FILE")
+  if [[ ! "$FIRST_LINE" =~ ^#! ]]; then
+    crit "1" "Missing shebang line"
+    fix "Add: #!/usr/bin/env python3"
+  elif [[ ! "$FIRST_LINE" =~ python3 ]]; then
+    warn "1" "Shebang uses '$FIRST_LINE' — prefer python3 explicitly"
+  else
+    ok "Shebang: $FIRST_LINE"
+  fi
+
+  # subprocess vs os.system
+  if grep -q 'os\.system' "$FILE"; then
+    OS_LINE=$(grep -n 'os\.system' "$FILE" | head -1 | cut -d: -f1)
+    crit "$OS_LINE" "Using os.system() — no error handling, shell injection risk"
+    fix "Use subprocess.run() or subprocess.Popen() with check=True"
+  fi
+
+  # Missing imports
+  for mod in subprocess os sys datetime; do
+    if grep -q "$mod\." "$FILE" && ! grep -qE "^import $mod|^from $mod" "$FILE"; then
+      crit "?" "Uses $mod but missing 'import $mod'"
+    fi
+  done
+
+  # Error handling
+  if grep -q 'subprocess' "$FILE"; then
+    if ! grep -q 'try\|check=True\|returncode\|\.wait()' "$FILE"; then
+      warn "?" "subprocess calls without error handling"
+      fix "Use subprocess.run(..., check=True) or check .returncode"
+    fi
+  fi
+
+  header "pg_dump / Database"
+
+  if grep -q 'pg_dump' "$FILE"; then
+    PG_LINE=$(grep -n 'pg_dump' "$FILE" | head -1 | cut -d: -f1)
+    ok "pg_dump command found (line $PG_LINE)"
+
+    # Check if it's a string (shell injection) vs list (safe)
+    PG_CONTENT=$(sed -n "${PG_LINE}p" "$FILE")
+    if echo "$PG_CONTENT" | grep -qE "os\.system|shell=True.*pg_dump"; then
+      crit "$PG_LINE" "Running pg_dump via shell — use subprocess with list args"
+      fix "subprocess.run(['pg_dump', '-h', host, '-U', user, '-d', db], check=True)"
+    fi
+  fi
+
+  header "File Handling"
+
+  # os.makedirs
+  if grep -qE 'BACKUP_DIR|backup_dir|output_dir' "$FILE"; then
+    if ! grep -q 'makedirs\|os\.mkdir\|Path.*mkdir' "$FILE"; then
+      warn "?" "Backup directory used but never created"
+      fix "Add: os.makedirs(BACKUP_DIR, exist_ok=True)"
+    else
+      ok "Directory creation present"
+    fi
+  fi
+
+  # File handling
+  if grep -q 'open(' "$FILE" && ! grep -q 'with open\|contextlib' "$FILE"; then
+    OPEN_LINE=$(grep -n 'open(' "$FILE" | grep -v 'with' | head -1 | cut -d: -f1)
+    if [[ -n "$OPEN_LINE" ]]; then
+      warn "$OPEN_LINE" "open() without 'with' — file handle may not be closed"
+      fix "Use: with open(filename, 'wb') as f:"
+    fi
+  fi
+
+  header "Compression & Retention"
+
+  if grep -q 'gzip\|\.gz\|compress\|zlib' "$FILE"; then
+    ok "Compression detected"
+  else
+    warn "?" "No compression — consider gzip or zlib"
+  fi
+
+else
+  echo -e "${RED}Unsupported file type: $EXT${NC}"
+  echo "Supported: .sh (bash), .py (python)"
+  exit 2
+fi
+
+# ═══════════════════════════════════════
+# UNIVERSAL CHECKS
+# ═══════════════════════════════════════
+header "Security"
+
+# Hardcoded passwords
+LINENUM=0
+while IFS= read -r line; do
+  ((LINENUM++))
+  if [[ "$line" =~ ^[[:space:]]*# ]]; then continue; fi
+  if echo "$line" | grep -qiE 'password\s*=\s*["\x27][^"]+["\x27]|passwd\s*=\s*["\x27]'; then
+    crit "$LINENUM" "Possible hardcoded password"
+    fix "Use environment variable or secrets manager"
+  fi
+done < "$FILE"
+ok "Security scan complete"
+
+# Executable check
+if [[ ! -x "$FILE" ]]; then
+  warn "?" "Script is not executable"
+  fix "chmod +x $FILE"
+fi
+
+# ── Summary ──
+echo ""
+echo -e "${BOLD}━━━ Summary ━━━${NC}"
+echo -e "  File: $FILENAME ($LINES lines)"
+if [[ $ISSUES -eq 0 ]] && [[ $WARNINGS -eq 0 ]]; then
+  echo -e "  ${GREEN}${BOLD}✓ No issues found — script looks solid${NC}"
+  exit 0
+elif [[ $ISSUES -eq 0 ]]; then
+  echo -e "  ${YELLOW}${BOLD}⚠ $WARNINGS warning(s) — review recommended${NC}"
+  exit 0
+else
+  echo -e "  ${RED}${BOLD}✗ $ISSUES critical issue(s), $WARNINGS warning(s)${NC}"
+  exit 1
+fi

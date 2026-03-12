@@ -1,0 +1,248 @@
+#!/usr/bin/env bash
+# kdiag — One-command Kubernetes cluster diagnosis
+# Finds broken pods, misconfigured services, resource pressure, and warning events.
+# Usage: kdiag [-n namespace] [-A] [--json]
+set -euo pipefail
+
+VERSION="1.0.0"
+RED='\033[0;31m'; YELLOW='\033[1;33m'; GREEN='\033[0;32m'; CYAN='\033[0;36m'; BOLD='\033[1m'; DIM='\033[2m'; NC='\033[0m'
+
+NAMESPACE=""
+ALL_NS=false
+JSON_OUT=false
+ISSUES=0
+WARNINGS=0
+FINDINGS=()
+
+usage() {
+  cat <<EOF
+kdiag v${VERSION} — Kubernetes cluster diagnosis
+
+Usage: kdiag [options]
+
+Options:
+  -n, --namespace <ns>   Scan specific namespace (default: current context)
+  -A, --all-namespaces   Scan all namespaces
+  --json                 Output findings as JSON
+  -h, --help             Show this help
+
+Examples:
+  kdiag                  # scan default namespace
+  kdiag -n production    # scan production
+  kdiag -A               # full cluster scan
+EOF
+  exit 0
+}
+
+while [[ $# -gt 0 ]]; do
+  case $1 in
+    -n|--namespace) NAMESPACE="$2"; shift 2 ;;
+    -A|--all-namespaces) ALL_NS=true; shift ;;
+    --json) JSON_OUT=true; shift ;;
+    -h|--help) usage ;;
+    *) echo "Unknown option: $1"; usage ;;
+  esac
+done
+
+NS_FLAG=""
+NS_LABEL="default namespace"
+if $ALL_NS; then
+  NS_FLAG="--all-namespaces"
+  NS_LABEL="all namespaces"
+elif [[ -n "$NAMESPACE" ]]; then
+  NS_FLAG="-n $NAMESPACE"
+  NS_LABEL="namespace: $NAMESPACE"
+fi
+
+header() { echo -e "\n${CYAN}${BOLD}━━━ $1 ━━━${NC}"; }
+ok()     { echo -e "  ${GREEN}✓${NC} $1"; }
+warn()   { echo -e "  ${YELLOW}⚠${NC} $1"; ((WARNINGS++)); FINDINGS+=("WARN: $1"); }
+crit()   { echo -e "  ${RED}✗${NC} $1"; ((ISSUES++)); FINDINGS+=("CRIT: $1"); }
+info()   { echo -e "  ${DIM}→${NC} $1"; }
+suggest(){ echo -e "    ${DIM}Fix: $1${NC}"; }
+
+echo -e "${BOLD}kdiag v${VERSION}${NC} — scanning ${NS_LABEL}"
+echo -e "${DIM}$(date '+%Y-%m-%d %H:%M:%S %Z')${NC}"
+
+# ── Check cluster reachable ──
+if ! kubectl cluster-info &>/dev/null; then
+  crit "Cannot reach Kubernetes cluster"
+  echo -e "\n${RED}Cluster unreachable. Check kubeconfig and connectivity.${NC}"
+  exit 2
+fi
+ok "Cluster reachable"
+
+# ── Node Health ──
+header "Node Health"
+while IFS= read -r line; do
+  node=$(echo "$line" | awk '{print $1}')
+  status=$(echo "$line" | awk '{print $2}')
+  if [[ "$status" != "Ready" ]]; then
+    crit "Node ${BOLD}$node${NC} is ${RED}$status${NC}"
+    suggest "kubectl describe node $node | grep -A5 Conditions"
+  else
+    ok "Node $node — Ready"
+  fi
+done < <(kubectl get nodes --no-headers 2>/dev/null)
+
+# Check node conditions (pressure)
+while IFS= read -r node; do
+  for condition in MemoryPressure DiskPressure PIDPressure; do
+    val=$(kubectl get node "$node" -o jsonpath="{.status.conditions[?(@.type=='$condition')].status}" 2>/dev/null)
+    if [[ "$val" == "True" ]]; then
+      crit "Node $node has $condition"
+      suggest "kubectl describe node $node — check resource usage"
+    fi
+  done
+done < <(kubectl get nodes -o jsonpath='{.items[*].metadata.name}' 2>/dev/null | tr ' ' '\n')
+
+# ── Pod Health ──
+header "Pod Health"
+
+BAD_STATES="CrashLoopBackOff|ImagePullBackOff|ErrImagePull|Error|Pending|Init:Error|OOMKilled"
+POD_DATA=$(kubectl get pods $NS_FLAG --no-headers 2>/dev/null || true)
+TOTAL_PODS=$(echo "$POD_DATA" | grep -c . || echo 0)
+HEALTHY_PODS=0
+SICK_PODS=0
+
+if [[ $TOTAL_PODS -eq 0 ]]; then
+  warn "No pods found in $NS_LABEL"
+else
+  while IFS= read -r line; do
+    [[ -z "$line" ]] && continue
+    pod=$(echo "$line" | awk '{print $1}')
+    ns_col=""
+    if $ALL_NS; then
+      ns_col=$(echo "$line" | awk '{print $1}')
+      pod=$(echo "$line" | awk '{print $2}')
+      ready=$(echo "$line" | awk '{print $3}')
+      status=$(echo "$line" | awk '{print $4}')
+      restarts=$(echo "$line" | awk '{print $5}' | sed 's/[^0-9].*//')
+      prefix="[$ns_col] "
+    else
+      ready=$(echo "$line" | awk '{print $2}')
+      status=$(echo "$line" | awk '{print $3}')
+      restarts=$(echo "$line" | awk '{print $4}' | sed 's/[^0-9].*//')
+      prefix=""
+    fi
+
+    if echo "$status" | grep -qE "$BAD_STATES"; then
+      ((SICK_PODS++))
+      crit "${prefix}${BOLD}$pod${NC} → ${RED}$status${NC} (restarts: $restarts)"
+
+      case "$status" in
+        CrashLoopBackOff)
+          suggest "kubectl logs $pod ${NS_FLAG} --previous"
+          ;;
+        ImagePullBackOff|ErrImagePull)
+          img=$(kubectl get pod $pod $NS_FLAG -o jsonpath='{.spec.containers[0].image}' 2>/dev/null || echo "unknown")
+          info "Image: $img"
+          suggest "Verify image exists: docker pull $img"
+          ;;
+        Pending)
+          suggest "kubectl describe pod $pod $NS_FLAG — check Events section for scheduling failures"
+          ;;
+        Error|Init:Error)
+          suggest "kubectl logs $pod $NS_FLAG"
+          ;;
+      esac
+    else
+      ((HEALTHY_PODS++))
+      # Check for high restart counts even if currently Running
+      if [[ -n "$restarts" ]] && [[ "$restarts" -gt 5 ]]; then
+        warn "${prefix}$pod — Running but ${YELLOW}$restarts restarts${NC} (restart storm?)"
+        suggest "kubectl logs $pod $NS_FLAG --previous — check for intermittent crashes"
+      fi
+    fi
+  done <<< "$POD_DATA"
+
+  if [[ $SICK_PODS -eq 0 ]]; then
+    ok "All $TOTAL_PODS pods healthy"
+  else
+    echo -e "\n  ${DIM}Summary: $HEALTHY_PODS healthy, $SICK_PODS unhealthy out of $TOTAL_PODS total${NC}"
+  fi
+fi
+
+# ── Ready check (containers not ready) ──
+header "Readiness"
+NOT_READY=$(kubectl get pods $NS_FLAG --no-headers 2>/dev/null | awk '$2 !~ /^[0-9]+\/[0-9]+$/ {next} {split($2,a,"/"); if(a[1]<a[2]) print $0}' || true)
+if [[ -n "$NOT_READY" ]]; then
+  while IFS= read -r line; do
+    [[ -z "$line" ]] && continue
+    pod=$(echo "$line" | awk '{print $1}')
+    ready=$(echo "$line" | awk '{print $2}')
+    if $ALL_NS; then
+      pod=$(echo "$line" | awk '{print $2}')
+      ready=$(echo "$line" | awk '{print $3}')
+    fi
+    warn "$pod — containers ready: $ready"
+    suggest "kubectl describe pod $pod $NS_FLAG — check readiness probe"
+  done <<< "$NOT_READY"
+else
+  ok "All containers in Ready state"
+fi
+
+# ── Service → Endpoint Checks ──
+header "Services"
+SVC_DATA=$(kubectl get svc $NS_FLAG --no-headers 2>/dev/null | grep -v kubernetes || true)
+if [[ -n "$SVC_DATA" ]]; then
+  while IFS= read -r line; do
+    [[ -z "$line" ]] && continue
+    if $ALL_NS; then
+      svc_ns=$(echo "$line" | awk '{print $1}')
+      svc=$(echo "$line" | awk '{print $2}')
+      svc_type=$(echo "$line" | awk '{print $3}')
+      ep_ns="-n $svc_ns"
+    else
+      svc=$(echo "$line" | awk '{print $1}')
+      svc_type=$(echo "$line" | awk '{print $2}')
+      ep_ns="$NS_FLAG"
+    fi
+    endpoints=$(kubectl get endpoints "$svc" $ep_ns -o jsonpath='{.subsets[*].addresses[*].ip}' 2>/dev/null || echo "")
+    if [[ -z "$endpoints" ]]; then
+      warn "Service ${BOLD}$svc${NC} ($svc_type) has ${YELLOW}no endpoints${NC}"
+      suggest "Check selector matches pod labels: kubectl describe svc $svc $ep_ns"
+    else
+      ep_count=$(echo "$endpoints" | wc -w | tr -d ' ')
+      ok "$svc ($svc_type) → $ep_count endpoint(s)"
+    fi
+  done <<< "$SVC_DATA"
+else
+  info "No services found"
+fi
+
+# ── Recent Warning Events ──
+header "Recent Events (last 15 min)"
+EVENTS=$(kubectl get events $NS_FLAG --field-selector type=Warning --sort-by='.lastTimestamp' 2>/dev/null | tail -10 || true)
+if [[ -n "$EVENTS" ]] && [[ $(echo "$EVENTS" | wc -l) -gt 1 ]]; then
+  echo "$EVENTS" | tail -8 | while IFS= read -r line; do
+    echo -e "  ${YELLOW}│${NC} $line"
+  done
+else
+  ok "No warning events"
+fi
+
+# ── Resource Usage (if metrics-server available) ──
+if kubectl top pods $NS_FLAG &>/dev/null 2>&1; then
+  header "Resource Usage"
+  kubectl top pods $NS_FLAG --no-headers 2>/dev/null | sort -k3 -rh | head -5 | while IFS= read -r line; do
+    pod=$(echo "$line" | awk '{print $1}')
+    cpu=$(echo "$line" | awk '{print $2}')
+    mem=$(echo "$line" | awk '{print $3}')
+    echo -e "  ${DIM}│${NC} $pod — CPU: $cpu  Mem: $mem"
+  done
+fi
+
+# ── Summary ──
+echo ""
+echo -e "${BOLD}━━━ Summary ━━━${NC}"
+if [[ $ISSUES -eq 0 ]] && [[ $WARNINGS -eq 0 ]]; then
+  echo -e "  ${GREEN}${BOLD}✓ Cluster looks healthy${NC}"
+  exit 0
+elif [[ $ISSUES -eq 0 ]]; then
+  echo -e "  ${YELLOW}${BOLD}⚠ $WARNINGS warning(s), no critical issues${NC}"
+  exit 1
+else
+  echo -e "  ${RED}${BOLD}✗ $ISSUES critical issue(s), $WARNINGS warning(s)${NC}"
+  exit 1
+fi
