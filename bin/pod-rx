@@ -85,8 +85,8 @@ find_worst() {
   done < <(kubectl get pods $NS_FLAG --no-headers 2>/dev/null)
 
   if [[ -z "$worst" ]]; then
-    echo -e "${GREEN}All pods look healthy — nothing to diagnose.${NC}"
-    exit 0
+    echo ""
+    return 0
   fi
   echo "$worst"
 }
@@ -99,7 +99,7 @@ diagnose_pod() {
 
   # Get pod info
   local pod_json
-  pod_json=$(kubectl get pod "$target" $NS_FLAG -o json 2>/dev/null)
+  pod_json=$(kubectl get pod "$target" $NS_FLAG -o json 2>/dev/null || echo "")
   if [[ -z "$pod_json" ]]; then
     echo -e "${RED}Pod '$target' not found${NC}"
     return 1
@@ -291,9 +291,9 @@ fi
 
 # ── Worst Mode ──
 if $WORST_MODE; then
-  POD=$(find_worst)
-  if [[ "$POD" == "All pods"* ]]; then
-    echo "$POD"
+  POD=$(find_worst 2>/dev/null || echo "")
+  if [[ -z "$POD" ]] || [[ "$POD" == "All pods"* ]]; then
+    echo -e "${GREEN}All pods look healthy — nothing to diagnose.${NC}"
     exit 0
   fi
 fi

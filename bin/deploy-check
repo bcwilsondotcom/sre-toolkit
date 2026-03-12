@@ -59,9 +59,9 @@ done
 
 [[ -z "$DEPLOYMENT" ]] && { echo "Error: deployment name required"; usage; }
 
-pass()  { echo -e "  ${GREEN}✓${NC} $1"; ((PASSED++)); }
-fail()  { echo -e "  ${RED}✗${NC} $1"; ((FAILED++)); }
-warn()  { echo -e "  ${YELLOW}⚠${NC} $1"; ((WARNED++)); }
+pass()  { echo -e "  ${GREEN}✓${NC} $1"; ((PASSED++)) || true; }
+fail()  { echo -e "  ${RED}✗${NC} $1"; ((FAILED++)) || true; }
+warn()  { echo -e "  ${YELLOW}⚠${NC} $1"; ((WARNED++)) || true; }
 info()  { echo -e "  ${DIM}→${NC} $1"; }
 step()  { echo -e "\n${CYAN}${BOLD}[$1/$TOTAL]${NC} $2"; }
 

@@ -56,8 +56,8 @@ fi
 
 header() { echo -e "\n${CYAN}${BOLD}━━━ $1 ━━━${NC}"; }
 ok()     { echo -e "  ${GREEN}✓${NC} $1"; }
-warn()   { echo -e "  ${YELLOW}⚠${NC} $1"; ((WARNINGS++)); FINDINGS+=("WARN: $1"); }
-crit()   { echo -e "  ${RED}✗${NC} $1"; ((ISSUES++)); FINDINGS+=("CRIT: $1"); }
+warn()   { echo -e "  ${YELLOW}⚠${NC} $1"; ((WARNINGS++)) || true; FINDINGS+=("WARN: $1"); }
+crit()   { echo -e "  ${RED}✗${NC} $1"; ((ISSUES++)) || true; FINDINGS+=("CRIT: $1"); }
 info()   { echo -e "  ${DIM}→${NC} $1"; }
 suggest(){ echo -e "    ${DIM}Fix: $1${NC}"; }
 
@@ -127,7 +127,7 @@ else
     fi
 
     if echo "$status" | grep -qE "$BAD_STATES"; then
-      ((SICK_PODS++))
+      ((SICK_PODS++)) || true
       crit "${prefix}${BOLD}$pod${NC} → ${RED}$status${NC} (restarts: $restarts)"
 
       case "$status" in
@@ -147,7 +147,7 @@ else
           ;;
       esac
     else
-      ((HEALTHY_PODS++))
+      ((HEALTHY_PODS++)) || true
       # Check for high restart counts even if currently Running
       if [[ -n "$restarts" ]] && [[ "$restarts" -gt 5 ]]; then
         warn "${prefix}$pod — Running but ${YELLOW}$restarts restarts${NC} (restart storm?)"

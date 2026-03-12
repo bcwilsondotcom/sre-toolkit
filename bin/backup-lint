@@ -52,9 +52,9 @@ EXT="${FILENAME##*.}"
 
 header() { echo -e "\n${CYAN}${BOLD}━━━ $1 ━━━${NC}"; }
 ok()     { echo -e "  ${GREEN}✓${NC} $1"; }
-warn()   { echo -e "  ${YELLOW}⚠${NC} ${YELLOW}Line $1:${NC} $2"; ((WARNINGS++)); }
-crit()   { echo -e "  ${RED}✗${NC} ${RED}Line $1:${NC} $2"; ((ISSUES++)); }
-fix()    { $FIX_MODE && echo -e "    ${DIM}→ Fix: $1${NC}"; }
+warn()   { echo -e "  ${YELLOW}⚠${NC} ${YELLOW}Line $1:${NC} $2"; ((WARNINGS++)) || true; }
+crit()   { echo -e "  ${RED}✗${NC} ${RED}Line $1:${NC} $2"; ((ISSUES++)) || true; }
+fix()    { $FIX_MODE && echo -e "    ${DIM}→ Fix: $1${NC}" || true; }
 note()   { echo -e "  ${DIM}ℹ $1${NC}"; }
 line_at(){ sed -n "${1}p" "$FILE"; }
 
@@ -157,7 +157,7 @@ if [[ "$EXT" == "sh" ]] || head -1 "$FILE" | grep -q 'bash\|/bin/sh'; then
   # Unquoted variables in paths
   LINENUM=0
   while IFS= read -r line; do
-    ((LINENUM++))
+    ((LINENUM++)) || true
     # Look for unquoted $VAR in file paths (not in comments)
     if [[ ! "$line" =~ ^[[:space:]]*# ]] && echo "$line" | grep -qE '[^"]\$[A-Z_]+[^"$].*/' 2>/dev/null; then
       if echo "$line" | grep -qE '(cp|mv|rm|cat|gzip|pg_dump|>).*[^"]\$[A-Z_]'; then
@@ -310,7 +310,7 @@ header "Security"
 # Hardcoded passwords
 LINENUM=0
 while IFS= read -r line; do
-  ((LINENUM++))
+  ((LINENUM++)) || true
   if [[ "$line" =~ ^[[:space:]]*# ]]; then continue; fi
   if echo "$line" | grep -qiE 'password\s*=\s*["\x27][^"]+["\x27]|passwd\s*=\s*["\x27]'; then
     crit "$LINENUM" "Possible hardcoded password"
