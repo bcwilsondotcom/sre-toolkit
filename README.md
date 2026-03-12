@@ -12,6 +12,7 @@ Built for real-world incident response — not demos.
 | [`backup-lint`](#backup-lint) | Static analysis for backup scripts — catches common pg_dump, cron, and permission bugs before they bite |
 | [`deploy-check`](#deploy-check) | Post-deployment verification — confirms rollout health, endpoint reachability, and rollback readiness |
 | [`pod-rx`](#pod-rx) | Interactive pod prescription engine — reads symptoms, suggests fixes, applies them |
+| [`py-diagnose`](#py-diagnose) | Python web app diagnostic — finds syntax errors, Django/Flask misconfig, DB bugs, Dockerfile issues |
 
 ## Install
 
@@ -112,6 +113,26 @@ pod-rx <pod-name>           # diagnose a specific pod
 pod-rx --worst              # auto-find the most broken pod
 pod-rx --watch              # continuous monitoring mode
 ```
+
+---
+
+## py-diagnose
+
+Find bugs in Python web apps before they bite. Built for Django, Flask, and FastAPI.
+
+```bash
+py-diagnose /app               # scan app directory
+py-diagnose /srv/webapp --deep  # deep scan (test imports, check DB, verify migrations)
+```
+
+**What it catches:**
+- Syntax errors (compile-time check on every .py file)
+- Missing imports and requirements gaps
+- Django: empty ALLOWED_HOSTS (→ 400), wrong DB host/port, placeholder passwords, missing migrations
+- Flask: binding to 127.0.0.1 (unreachable in Docker), missing config
+- Dockerfile issues: missing WORKDIR, port mismatches, no pip install
+- Python 2 vs 3 issues (print statements)
+- Tab/space mixing
 
 ---
 
